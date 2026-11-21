@@ -1,5 +1,13 @@
 # Bot de Telegram para OpenCode
 
+[![Licencia: MIT](https://img.shields.io/badge/licencia-MIT-green.svg)](LICENSE)
+[![Última versión](https://img.shields.io/badge/descarga-v1.0.0-blue.svg)](https://github.com/rortizrojo/telegram-opencode-bot/releases/latest)
+![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D6)
+
+> **Instalación rápida:** descarga el ZIP desde
+> [Releases](https://github.com/rortizrojo/telegram-opencode-bot/releases/latest),
+> descomprímelo y ejecuta `instalar.cmd`.
+
 Controla [OpenCode](https://opencode.ai) desde Telegram: le escribes por el móvil y el agente
 trabaja en tu PC (lee, edita y ejecuta código), devolviéndote la respuesta al chat.
 
