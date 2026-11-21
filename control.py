@@ -3,6 +3,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 import tkinter as tk
 from tkinter import messagebox
@@ -54,6 +55,13 @@ def _env_para_hijos() -> dict:
     return env
 
 CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW
+
+# ---------------------------------------------------------------- configuracion
+_CFG = _leer_env()
+MODO = (_CFG.get("MODO") or "v2").strip().lower()            # "v2" (motor propio) o "v1" (motor externo/WSL)
+OPENCODE_URL = (_CFG.get("OPENCODE_URL") or "http://127.0.0.1:4095").rstrip("/")
+WSL_DISTRO = (_CFG.get("WSL_DISTRO") or "").strip()
+WSL_CMD = (_CFG.get("WSL_CMD") or "").strip()
 
 btn_start = None
 btn_stop = None
@@ -141,10 +149,55 @@ def shim_alive() -> bool:
         return False
 
 
-def ensure_shim(timeout: int = 45) -> bool:
-    """Arranca el motor (shim v1->v2) si no esta escuchando."""
-    if shim_alive():
+def motor_externo_arriba() -> bool:
+    """Comprueba el motor v1 (propio o en WSL) por HTTP: 401 tambien cuenta como arriba."""
+    try:
+        req = urllib.request.Request(OPENCODE_URL + "/session")
+        try:
+            with urllib.request.urlopen(req, timeout=3) as r:
+                return r.status in (200, 401, 403)
+        except urllib.error.HTTPError as e:
+            return e.code in (401, 403)
+    except Exception:
+        return False
+
+
+def motor_arriba() -> bool:
+    return motor_externo_arriba() if MODO == "v1" else shim_alive()
+
+
+def _arrancar_en_wsl() -> bool:
+    """Lanza el motor dentro de WSL en segundo plano (si esta configurado)."""
+    if not WSL_CMD:
+        return False
+    cmd = (
+        "setsid nohup " + WSL_CMD +
+        " >/tmp/opencode-wsl.log 2>&1 </dev/null & disown; echo lanzado"
+    )
+    args = ["wsl.exe"]
+    if WSL_DISTRO:
+        args += ["-d", WSL_DISTRO]
+    args += ["-e", "bash", "-lc", cmd]
+    try:
+        subprocess.Popen(args, creationflags=CREATE_NO_WINDOW)
         return True
+    except Exception:
+        return False
+
+
+def ensure_shim(timeout: int = 45) -> bool:
+    """Deja el motor disponible: shim propio (v2) o motor externo/WSL (v1)."""
+    if motor_arriba():
+        return True
+    if MODO == "v1":
+        if not _arrancar_en_wsl():
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1)
+            if motor_arriba():
+                return True
+        return False
     if not os.path.exists(SHIM_SCRIPT):
         return False
     subprocess.Popen(
@@ -162,7 +215,9 @@ def ensure_shim(timeout: int = 45) -> bool:
 
 
 def stop_shim():
-    """Para el shim y su motor v2 (arbol de procesos)."""
+    """Para el shim y su motor v2 (arbol de procesos). En modo v1 no toca nada externo."""
+    if MODO == "v1":
+        return
     for pid in _scan_pids("oc_shim.py"):
         subprocess.run(
             ["taskkill", "/PID", str(pid), "/T", "/F"],
@@ -178,10 +233,13 @@ def update_buttons():
     text = f"RUNNING ({', '.join(str(p) for p in pids)})" if running else "STOPPED"
     status_label.config(text=text, fg=color)
 
-    shim_label.config(
-        text="motor v2: OK" if shim_alive() else "motor v2: parado",
-        fg="green" if shim_alive() else "#d08b00",
-    )
+    if MODO == "v1":
+        arriba = motor_externo_arriba()
+        etiqueta = "motor v1 (WSL): " + ("OK" if arriba else "parado")
+    else:
+        arriba = shim_alive()
+        etiqueta = "motor v2: " + ("OK" if arriba else "parado")
+    shim_label.config(text=etiqueta, fg="green" if arriba else "#d08b00")
 
     btn_start.config(state=tk.DISABLED if running else tk.NORMAL)
     btn_stop.config(state=tk.NORMAL if running else tk.DISABLED)
@@ -210,11 +268,19 @@ def start_bot():
             return
 
         if not ensure_shim():
-            messagebox.showerror(
-                "Error",
-                "No pude arrancar el motor v2 (oc_shim.py).\n"
-                "Revisa oc_shim.log en la carpeta del bot.",
-            )
+            if MODO == "v1":
+                detalle = (
+                    "No encuentro el motor en " + OPENCODE_URL + ".\n\n"
+                    "Arrancalo dentro de WSL con:\n"
+                    "  opencode serve --port 4096 --hostname 0.0.0.0\n\n"
+                    "O rellena WSL_CMD en .env para que el panel lo arranque solo."
+                )
+            else:
+                detalle = (
+                    "No pude arrancar el motor v2 (oc_shim.py).\n"
+                    "Revisa oc_shim.log en la carpeta del bot."
+                )
+            messagebox.showerror("Error", detalle)
             update_buttons()
             return
 

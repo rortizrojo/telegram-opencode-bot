@@ -29,6 +29,19 @@ Write-Host "  Carpeta: $root" -ForegroundColor DarkGray
 
 try {
 
+    # ---------------------------------------------------------------- config previa
+    $envPath = Join-Path $root ".env"
+    $cfg = @{}
+    if (Test-Path $envPath) {
+        Get-Content $envPath | ForEach-Object {
+            $l = $_.Trim()
+            if ($l -and -not $l.StartsWith("#") -and $l.Contains("=")) {
+                $k, $v = $l.Split("=", 2)
+                $cfg[$k.Trim()] = $v.Trim()
+            }
+        }
+    }
+
     # ---------------------------------------------------------------- python
     Titulo "1/6  Python"
 
@@ -100,7 +113,7 @@ try {
     Ok "Entorno: $venv"
 
     Titulo "3/6  Dependencias"
-    & $vpy -m pip install --upgrade pip --quiet --disable-pip-version-check
+    # Sin actualizar pip: en Windows el auto-upgrade deja el pip del venv a medias.
     & $vpy -m pip install -r (Join-Path $root "requirements.txt") --quiet --disable-pip-version-check
     if ($LASTEXITCODE -ne 0) { throw "Fallo la instalacion de dependencias (revisa la conexion a internet)." }
     Ok "Dependencias instaladas"
@@ -140,30 +153,60 @@ try {
     }
 
     $motor = Buscar-Motor
+    $modo = "v2"
+    $urlMotor = "http://127.0.0.1:4095"
+    $wslCmd = $cfg["WSL_CMD"]
+    $wslDistro = $cfg["WSL_DISTRO"]
     if ($motor) {
-        Ok "Motor encontrado: $motor"
+        Ok "Motor v2 encontrado: $motor"
     } else {
-        Aviso "No encontre opencode-cli.exe."
-        Write-Host "   Instala la app de escritorio de OpenCode (https://opencode.ai) y vuelve a ejecutar" -ForegroundColor Gray
-        Write-Host "   el instalador, o indica la ruta a mano en el fichero .env con OC_ENGINE=..." -ForegroundColor Gray
-        $r = Read-Host "   ?Abrir la pagina de descarga ahora? (S/N)"
-        if ($r -match '^[sSyY]') { Start-Process "https://opencode.ai" }
+        Aviso "No encontre opencode-cli.exe en Windows."
+
+        if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+            $env:WSL_UTF8 = "1"   # sin esto, wsl devuelve UTF-16 y los nombres llegan con basura
+            $distros = @()
+            try {
+                $distros = @(& wsl.exe -l -q 2>$null |
+                    ForEach-Object { ($_ -replace "`0", "").Trim() } |
+                    Where-Object { $_ -match '^[A-Za-z0-9._-]+$' })
+            } catch { }
+            if ($distros.Count -gt 0) {
+                Write-Host "   WSL detectado: $($distros -join ', ')" -ForegroundColor Gray
+                $donde = ""
+                try {
+                    $salida = & wsl.exe -e bash -lc "command -v opencode" 2>$null
+                    if ($LASTEXITCODE -eq 0 -and $salida) {
+                        $ruta = (($salida | Select-Object -First 1) -replace "`0", "").Trim()
+                        # solo vale una ruta absoluta de Linux (un error de WSL no lo es)
+                        if ($ruta -match '^/') { $donde = $ruta }
+                    }
+                } catch { }
+                if ($donde) {
+                    Ok "OpenCode esta en WSL: $donde"
+                    $r = Read-Host "   ?Usar ese motor (modo v1)? (S/N)"
+                    if ($r -match '^[sSyY]') {
+                        $modo = "v1"
+                        $urlMotor = "http://127.0.0.1:4096"
+                        $wslCmd = "opencode serve --port 4096 --hostname 0.0.0.0"
+                        $wslDistro = $distros[0]
+                        Ok "Modo v1: el bot hablara con el motor de WSL en $urlMotor"
+                    }
+                } else {
+                    Aviso "WSL no tiene 'opencode' en el PATH."
+                }
+            }
+        }
+
+        if ($modo -eq "v2") {
+            Write-Host "   Instala la app de escritorio de OpenCode (https://opencode.ai) y repite," -ForegroundColor Gray
+            Write-Host "   o pon la ruta en .env con OC_ENGINE=..." -ForegroundColor Gray
+            $r = Read-Host "   ?Abrir la pagina de descarga ahora? (S/N)"
+            if ($r -match '^[sSyY]') { Start-Process "https://opencode.ai" }
+        }
     }
 
     # ---------------------------------------------------------------- token
     Titulo "5/6  Token del bot de Telegram"
-
-    $envPath = Join-Path $root ".env"
-    $cfg = @{}
-    if (Test-Path $envPath) {
-        Get-Content $envPath | ForEach-Object {
-            $l = $_.Trim()
-            if ($l -and -not $l.StartsWith("#") -and $l.Contains("=")) {
-                $k, $v = $l.Split("=", 2)
-                $cfg[$k.Trim()] = $v.Trim()
-            }
-        }
-    }
 
     $token = $cfg["TELEGRAM_TOKEN"]
     if ($token) {
@@ -189,11 +232,16 @@ try {
 
     $lineas = @(
         "# Configuracion del bot. NO compartas este fichero.",
+        "MODO=$modo",
         "TELEGRAM_TOKEN=$token",
-        "OPENCODE_URL=http://127.0.0.1:4095",
+        "OPENCODE_URL=$urlMotor",
         "OPENCODE_USER=opencode",
         "OPENCODE_PASS=opencode123"
     )
+    if ($modo -eq "v1") {
+        if ($wslDistro) { $lineas += "WSL_DISTRO=$wslDistro" }
+        if ($wslCmd)    { $lineas += "WSL_CMD=$wslCmd" }
+    }
     if ($cfg["OC_ENGINE"]) { $lineas += "OC_ENGINE=$($cfg['OC_ENGINE'])" }
     if ($cfg["OC_DIR"])    { $lineas += "OC_DIR=$($cfg['OC_DIR'])" }
     Set-Content -Path $envPath -Value $lineas -Encoding ASCII
@@ -217,32 +265,53 @@ try {
         Aviso "No pude crear el acceso directo: $($_.Exception.Message)"
     }
 
-    Write-Host "   Probando que el motor arranca..." -ForegroundColor Gray
-    if ($motor) { $env:OC_ENGINE = $motor }
-    $shim = Start-Process -FilePath $vpy `
-        -ArgumentList ('"' + (Join-Path $root "oc_shim.py") + '"') `
-        -WorkingDirectory $root -PassThru -WindowStyle Hidden
-
-    $sano = $false
-    for ($i = 0; $i -lt 60; $i++) {
-        Start-Sleep -Seconds 1
-        try {
-            $r = Invoke-WebRequest -Uri "http://127.0.0.1:4095/health" -TimeoutSec 3 -UseBasicParsing
-            if ($r.StatusCode -eq 200) { $sano = $true; break }
-        } catch { }
-    }
-
-    if ($sano) {
-        Ok "Motor v2 respondiendo"
-        $r = Invoke-RestMethod -Uri "http://127.0.0.1:4095/health" -TimeoutSec 5
-        Write-Host "   Estado: $($r | ConvertTo-Json -Compress)" -ForegroundColor Gray
+    if ($modo -eq "v1") {
+        Write-Host "   Comprobando el motor de WSL en $urlMotor ..." -ForegroundColor Gray
+        $sano = $false
+        for ($i = 0; $i -lt 20; $i++) {
+            try {
+                Invoke-WebRequest -Uri "$urlMotor/session" -TimeoutSec 3 -UseBasicParsing | Out-Null
+                $sano = $true; break
+            } catch {
+                if ($_.Exception.Response) { $sano = $true; break }
+            }
+            Start-Sleep -Seconds 1
+        }
+        if ($sano) {
+            Ok "Motor v1 respondiendo en $urlMotor"
+        } else {
+            Aviso "No hay ningun motor escuchando en $urlMotor."
+            Write-Host "   Arrancalo dentro de WSL con:" -ForegroundColor Gray
+            Write-Host "     opencode serve --port 4096 --hostname 0.0.0.0" -ForegroundColor Gray
+        }
     } else {
-        Aviso "El motor no respondio en 60 s. Revisa oc_shim.log en la carpeta."
-    }
+        Write-Host "   Probando que el motor arranca..." -ForegroundColor Gray
+        if ($motor) { $env:OC_ENGINE = $motor }
+        $shim = Start-Process -FilePath $vpy `
+            -ArgumentList ('"' + (Join-Path $root "oc_shim.py") + '"') `
+            -WorkingDirectory $root -PassThru -WindowStyle Hidden
 
-    # lo dejamos parado: el panel lo arranca y lo vigila
-    if ($shim -and -not $shim.HasExited) {
-        try { & taskkill /PID $shim.Id /T /F 2>$null | Out-Null } catch { }
+        $sano = $false
+        for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+                $r = Invoke-WebRequest -Uri "http://127.0.0.1:4095/health" -TimeoutSec 3 -UseBasicParsing
+                if ($r.StatusCode -eq 200) { $sano = $true; break }
+            } catch { }
+        }
+
+        if ($sano) {
+            Ok "Motor v2 respondiendo"
+            $r = Invoke-RestMethod -Uri "http://127.0.0.1:4095/health" -TimeoutSec 5
+            Write-Host "   Estado: $($r | ConvertTo-Json -Compress)" -ForegroundColor Gray
+        } else {
+            Aviso "El motor no respondio en 60 s. Revisa oc_shim.log en la carpeta."
+        }
+
+        # lo dejamos parado: el panel lo arranca y lo vigila
+        if ($shim -and -not $shim.HasExited) {
+            try { & taskkill /PID $shim.Id /T /F 2>$null | Out-Null } catch { }
+        }
     }
 
     Write-Host ""
@@ -254,8 +323,18 @@ try {
     Write-Host "   2. Pulsa Arrancar" -ForegroundColor White
     Write-Host "   3. En Telegram, habla con tu bot y envia /start" -ForegroundColor White
     Write-Host ""
+    if ($modo -eq "v1") {
+        Write-Host "   Importante: WSL debe estar arrancado y el motor escuchando en 0.0.0.0." -ForegroundColor Yellow
+        Write-Host "   Si el panel dice 'motor v1 (WSL): parado', arrancalo con:" -ForegroundColor Yellow
+        Write-Host "     opencode serve --port 4096 --hostname 0.0.0.0" -ForegroundColor Gray
+        Write-Host ""
+    }
     Write-Host "   Los modelos necesitan tu cuenta de OpenCode iniciada" -ForegroundColor Gray
-    Write-Host "   (abre la app de escritorio una vez y autentica tus proveedores)." -ForegroundColor Gray
+    if ($modo -eq "v1") {
+        Write-Host "   (WSL debe estar arrancado y el motor escuchando en 0.0.0.0)." -ForegroundColor Gray
+    } else {
+        Write-Host "   (abre la app de escritorio una vez y autentica tus proveedores)." -ForegroundColor Gray
+    }
     Write-Host ""
 
 } catch {
@@ -264,4 +343,5 @@ try {
     Write-Host ""
 }
 
+$LASTEXITCODE = 0
 Pausa
